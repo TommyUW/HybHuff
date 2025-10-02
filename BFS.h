@@ -3,7 +3,8 @@
 
 #include <vector>
 #include "hypergraph.h"
-
+#include "huffman_tree.h"
+using namespace std;
 /**
  * @file BFS.h
  * @brief Header for BFS-based graph algorithms on hypergraphs.
@@ -27,35 +28,22 @@
  * @param offsetV  CSR-style offset array for vertex→hyperedges.
  * @param offsetH  CSR-style offset array for hyperedge→vertices.
  */
-void runBFS(int nv, int nh, const int* degreeV, const int* edgesV,
-            const int* degreeH, const int* edgesH,
-            const int* offsetV, const int* offsetH);
 
-/**
- * @brief Run BFS from every vertex in the decoded adjacency list.
- *
- * Used to evaluate the full traversal cost and reachability.
- *
- * @param adj Adjacency list representation of the hypergraph (bipartite).
- */
-void runFullBFSAllVertices(const std::vector<std::vector<int>>& adj);
+ void runBFSFromSingleSource(
+    int n, const int* deg, const int* edges,
+    const uint16_t* huffCount, const uint16_t* bitCount,
+    const uint8_t* hi, const uint8_t* lo,
+    HuffmanNode* treeOpp, int fallbackBitsOpp,
+    int src,
+    const uint64_t* blockHi, const uint64_t* blockLo, int BLOCK   // <- blocks from encoder
+);
 
-/**
- * @brief Compute connected components of the bipartite hypergraph.
- *
- * Uses alternating BFS on the vertex-hyperedge bipartite structure.
- * Outputs the CSR offsets used by BFS routines.
- *
- * @param G        Pointer to the hypergraph structure.
- * @param nv       Number of vertices.
- * @param nh       Number of hyperedges.
- * @param adj      Output adjacency list (decoded bipartite graph).
- * @param offsetV  Output CSR offset for vertex→hyperedges.
- * @param offsetH  Output CSR offset for hyperedge→vertices.
- */
-void runConnectedComponents(Hypergraph* G, int nv, int nh,
-                            std::vector<std::vector<int>>& adj,
-                            std::vector<int>& offsetV,
-                            std::vector<int>& offsetH);
+// ---- BFS (raw / decoded) declarations ----
+vector<int> bfs_single_source_raw(
+    int n,
+    const int* deg,
+    const int* edges,
+    int src
+);
 
 #endif // BFS_H
