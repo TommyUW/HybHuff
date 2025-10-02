@@ -1,27 +1,7 @@
 // ============================================================================
-// File: main.cpp
-//
-// Description:
-// This program demonstrates a memory-efficient hypergraph compression algorithm
-// using a hybrid Huffman + bitwise fallback encoding scheme. The hypergraph is 
-// encoded by building a Huffman tree on the more frequent side (vertices or 
-// hyperedges), and encoding the other side using a mix of Huffman and fixed-width
-// binary codes.
-//
-// The encoded structure is then validated with decoding and used to perform 
-// analyses such as BFS, connected components, k-core decomposition, label 
-// propagation, and PageRank.
-//
-// The memory footprint is estimated based on whether the per-element bitCount
-// and degree arrays can be stored as uint16_t.
-//
-// Developed by:
-//   Tianyu Zhao, University of Washington
-//
-// Research Advisors:
-//   Prof. Dongfang Zhao  
-//   Dr. Luanzheng Guo  
-//   Dr. Nathan Tallent
+// File: main.cpp (complete, buildable)
+// Driver for HybHuff encode → estimate footprint → run BFS / K-core / PageRank
+// on both compressed (on-demand decode) and raw baselines, plus a full decode.
 // ============================================================================
 
 #include <chrono>
@@ -35,6 +15,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #include <cstdlib>
+#include <cstdint>     // uint8_t, uint16_t, uint64_t
 
 #include "hypergraph.h"
 #include "huffman_tree.h"
@@ -43,121 +24,78 @@
 #include "decode.h"
 #include "BFS.h"
 #include "computeKCore.h"
-#include "label_propagation.h"
 #include "pagerank.h"
-
+#include "misc.h"
 using namespace std;
 
-// -----------------------------------------------------------------------------
-// Memory footprint estimation functions
-// -----------------------------------------------------------------------------
-
-static size_t footprint(int n, long bitsH, long bitsL) {
-    long bH = (bitsH + 7) / 8, bL = (bitsL + 7) / 8;
-    return 2 * sizeof(int*)
-         + 2 * sizeof(uint8_t*)
-         + sizeof(int) * n
-         + sizeof(int) * n
-         + bH * sizeof(uint8_t)
-         + bL * sizeof(uint8_t);
-}
-
-static size_t footprint_one(int n, long bitsH, long bitsL) {
-    long bH = (bitsH + 7) / 8, bL = (bitsL + 7) / 8;
-    return 2 * sizeof(int*)
-         + 2 * sizeof(uint8_t*)
-         + sizeof(uint16_t) * n
-         + sizeof(int) * n
-         + bH * sizeof(uint8_t)
-         + bL * sizeof(uint8_t);
-}
-
-static size_t footprint_both(int n, long bitsH, long bitsL) {
-    long bH = (bitsH + 7) / 8, bL = (bitsL + 7) / 8;
-    return 2 * sizeof(int*)
-         + 2 * sizeof(uint8_t*)
-         + sizeof(uint16_t) * n
-         + sizeof(uint16_t) * n
-         + bH * sizeof(uint8_t)
-         + bL * sizeof(uint8_t);
-}
-
 int main(int argc, char** argv) {
-    if (argc != 6) {
-        cerr << "Usage: " << argv[0]
-             << " <pct> <input.hyper> <k_thresh> <lp_iters> <pr_iters>\n";
+    if (argc != 3) {
+        cerr << "Usage: " << argv[0] << " <pct> <input.hyper>\n";
         return 1;
     }
 
     // -------------------------------------------------------------------------
-    // Parse input parameters
+    // Parse params and load hypergraph
+    //   pct   : fraction (0–1) of items to encode via Huffman (passed as <pct>%)
+    //   fname : input hypergraph file
+    //   encodeH: choose which side to encode (encode hyperedges if nh >= nv)
     // -------------------------------------------------------------------------
     double pct = atof(argv[1]) * 0.01;
     const char* fname = argv[2];
-    int k_thresh  = atoi(argv[3]);
-    int lp_iters  = atoi(argv[4]);
-    int pr_iters  = atoi(argv[5]);
 
     Hypergraph* G = readHypergraph(fname);
     int nv = G->nv, nh = G->nh;
     bool encodeH = nv <= nh;
 
-    cout << "Compressing " << (encodeH ? "hyperedges" : "vertices")
-         << " (tree on " << (encodeH ? "vertices" : "hyperedges") << ")\n";
+    // -------------------------------------------------------------------------
+    // Encoding: build Huffman tree on the opposite side and encode the chosen side
+    // Outputs:
+    //   huffCount[i]  : #Huffman symbols in entry i
+    //   bitCount[i]   : #bits occupied by the Huffman section of entry i
+    //   hi / lo       : concatenated bitstreams (Huffman / fallback)
+    //   blockHi/Lo    : start bit offsets for each block (BLOCK entries)
+    //   bitsH / bitsL : total bits across the encoded side in hi/lo
+    // -------------------------------------------------------------------------
+    cout << "Encoding\n";
 
-    // -------------------------------------------------------------------------
-    // Encoding
-    // -------------------------------------------------------------------------
-    int fbV=0, fbH=0;
-    HuffmanNode *tV=nullptr, *tH=nullptr;
-    unordered_map<int,string> cV, cH;
-    int *bitCount = nullptr;
-    uint8_t *hi=nullptr, *lo=nullptr;
+    int fbV = 0, fbH = 0;                    // fallback bit-widths (V, H)
+    HuffmanNode *tV = nullptr, *tH = nullptr;
+    unordered_map<int,string> cV, cH;        // codes (not needed at runtime)
+    uint16_t *bitCount = nullptr;
+    uint16_t *huffCount = nullptr;
+    uint8_t  *hi = nullptr, *lo = nullptr;
     int bitsH = 0, bitsL = 0;
+
+    uint64_t *blockHi = nullptr, *blockLo = nullptr;
+    int nBlocks = 0;
+    const int BLOCK = 1024;                   // block size in entries (tunable)
 
     auto t_encode0 = chrono::high_resolution_clock::now();
 
     if (encodeH) {
         tV = buildTree(G->degreeV, nv, pct, fbV);
         genCodes(tV, cV);
-        tie(bitsH,bitsL) = encodeSide(nh, G->degreeH, G->edgesH, cV, fbV, bitCount, hi, lo);
+        tie(bitsH, bitsL) = encodeSide(
+            nh, G->degreeH, G->edgesH, cV, fbV,
+            huffCount, bitCount, hi, lo,
+            BLOCK, blockHi, blockLo, &nBlocks
+        );
     } else {
         tH = buildTree(G->degreeH, nh, pct, fbH);
         genCodes(tH, cH);
-        tie(bitsH,bitsL) = encodeSide(nv, G->degreeV, G->edgesV, cH, fbH, bitCount, hi, lo);
+        tie(bitsH, bitsL) = encodeSide(
+            nv, G->degreeV, G->edgesV, cH, fbH,
+            huffCount, bitCount, hi, lo,
+            BLOCK, blockHi, blockLo, &nBlocks
+        );
     }
 
     auto t_encode1 = chrono::high_resolution_clock::now();
+    cout << "Encoding Time: " << chrono::duration<double>(t_encode1 - t_encode0).count() << " s\n";
 
     // -------------------------------------------------------------------------
-    // Decoding
-    // -------------------------------------------------------------------------
-    auto t_decode0 = chrono::high_resolution_clock::now();
-    auto adj = encodeH
-      ? decodeSide(nh, G->degreeH, G->edgesH, bitCount, hi, lo, tV, fbV)
-      : decodeSide(nv, G->degreeV, G->edgesV, bitCount, hi, lo, tH, fbH);
-    auto t_decode1 = chrono::high_resolution_clock::now();
-
-    // -------------------------------------------------------------------------
-    // Reconstruct bipartite structure
-    // -------------------------------------------------------------------------
-    vector<vector<int>> v2he, he2v;
-    if (encodeH) {
-        he2v = adj;
-        v2he.assign(nv, {});
-        for (int e = 0; e < nh; ++e)
-            for (int v : he2v[e])
-                v2he[v].push_back(e);
-    } else {
-        v2he = adj;
-        he2v.assign(nh, {});
-        for (int v = 0; v < nv; ++v)
-            for (int e : v2he[v])
-                he2v[e].push_back(v);
-    }
-
-    // -------------------------------------------------------------------------
-    // Estimate memory footprint
+    // Footprint estimate: content (streams + metadata) + Huffman tree
+    //   Choose integer widths (uint16_t vs int) based on max deg/bitcount.
     // -------------------------------------------------------------------------
     size_t treeSize = encodeH ? treeMem(tV) : treeMem(tH);
     int n = encodeH ? nh : nv;
@@ -165,64 +103,134 @@ int main(int argc, char** argv) {
     int maxDeg = 0, maxBC = 0;
     for (int i = 0; i < n; ++i) {
         maxDeg = max(maxDeg, encodeH ? G->degreeH[i] : G->degreeV[i]);
-        maxBC  = max(maxBC, bitCount[i]);
+        maxBC  = max(maxBC, (int)bitCount[i]);
     }
 
     size_t contentSize = 0;
     if (maxDeg < (1 << 16) && maxBC < (1 << 16)) {
         contentSize = footprint_both(n, bitsH, bitsL);
-        cout << "[Footprint] Using uint16_t for both degree and bitCount\n";
     } else if (maxDeg < (1 << 16) || maxBC < (1 << 16)) {
         contentSize = footprint_one(n, bitsH, bitsL);
-        cout << "[Footprint] Using uint16_t for one of degree or bitCount\n";
     } else {
         contentSize = footprint(n, bitsH, bitsL);
-        cout << "[Footprint] Using full int32_t for both degree and bitCount\n";
     }
 
     cout << "Content size: " << (contentSize / 1024) << " KB\n";
-    cout << "Tree    size: " << (treeSize / 1024) << " KB\n";
+    cout << "Tree    size: " << (treeSize   / 1024) << " KB\n";
     cout << "Total   size: " << ((contentSize + treeSize) / 1024) << " KB\n";
 
     // -------------------------------------------------------------------------
-    // Analytic workloads: BFS, k-core, label propagation, PageRank
+    // BFS: compressed (on-demand decode) vs raw
+    //   Compressed: neighbors decoded per-vertex from block slices.
+    //   Raw: standard CSR BFS (deg[] + edges[]).
     // -------------------------------------------------------------------------
     auto t_bfs0 = chrono::high_resolution_clock::now();
-
-    vector<int> offsetV(nv + 1), offsetH(nh + 1);
-    runConnectedComponents(G, nv, nh, adj, offsetV, offsetH);
-
-    runBFS(nv, nh, G->degreeV, G->edgesV, G->degreeH, G->edgesH,
-           offsetV.data(), offsetH.data());
-
+    for (int i = 0; i < 5; i++) {
+        runBFSFromSingleSource(
+            encodeH ? nh : nv,
+            encodeH ? G->degreeH : G->degreeV,
+            encodeH ? G->edgesH  : G->edgesV,
+            huffCount, bitCount, hi, lo,
+            encodeH ? tV : tH, encodeH ? fbV : fbH,
+            i,
+            blockHi, blockLo, BLOCK
+        );
+    }
     auto t_bfs1 = chrono::high_resolution_clock::now();
-
-    //runFullBFSAllVertices(adj);
+    cout << "BFS(compressed) Time: "
+         << chrono::duration<double>(t_bfs1 - t_bfs0).count() << " s\n";
 
     auto t_bfs2 = chrono::high_resolution_clock::now();
-
-    auto t_k0 = chrono::high_resolution_clock::now();
-
-    auto inCore = computeKCore(v2he, he2v, k_thresh);
-    runLabelPropagation(v2he, he2v, inCore, lp_iters);
-
-    auto t_k1 = chrono::high_resolution_clock::now();
-
-    auto t_p0 = chrono::high_resolution_clock::now();
-    runPageRank(v2he, he2v, pr_iters);
-    auto t_p1 = chrono::high_resolution_clock::now();
+    for (int i = 0; i < 5; i++) {
+        auto dist_raw = bfs_single_source_raw(
+            encodeH ? nh : nv,
+            encodeH ? G->degreeH : G->degreeV,
+            encodeH ? G->edgesH  : G->edgesV,
+            i
+        );
+        (void)dist_raw; // used only for timing in this driver
+    }
+    auto t_bfs3 = chrono::high_resolution_clock::now();
+    cout << "BFS(raw) Time: "
+         << chrono::duration<double>(t_bfs3 - t_bfs2).count() << " s\n";
 
     // -------------------------------------------------------------------------
-    // Timing summary
+    // K-core: compressed (decode-on-demand) vs raw
+    //   We sweep k=1..5 on compressed, and k=1..2 on raw for timing.
     // -------------------------------------------------------------------------
-    cout << "Encoding Time: " << chrono::duration<double>(t_encode1 - t_encode0).count() << " s\n";
-    cout << "Decoding Time: " << chrono::duration<double>(t_decode1 - t_decode0).count() << " s\n";
-    cout << "Total (Enc+Dec): " << chrono::duration<double>(t_decode1 - t_encode0).count() << " s\n";
+    auto t_kcore0 = chrono::high_resolution_clock::now();
+    for (int i = 1; i <= 5; i++) {
+        auto inCore_dec = computeKCore_onDemand_decodeRandom(
+            n,
+            encodeH ? G->degreeH : G->degreeV,
+            huffCount, bitCount,
+            hi, lo,
+            encodeH ? tV : tH, encodeH ? fbV : fbH,
+            blockHi, blockLo, BLOCK,
+            i
+        );
+        (void)inCore_dec;
+    }
+    auto t_kcore1 = chrono::high_resolution_clock::now();
+    cout << "K-core(compressed) Time: "
+         << chrono::duration<double>(t_kcore1 - t_kcore0).count() << " s\n";
 
-    cout << "BFS Time: " << chrono::duration<double>(t_bfs1 - t_bfs0).count() << " s\n"; 
-    cout << "BFS All Vertices Time: " << chrono::duration<double>(t_bfs2 - t_bfs0).count() << " s\n"; 
-    cout << "K-Core + Label Propagation Time: " << chrono::duration<double>(t_k1 - t_k0).count() << " s\n"; 
-    cout << "PageRank Time: " << chrono::duration<double>(t_p1 - t_p0).count() << " s\n"; 
+    auto t_kcore2 = chrono::high_resolution_clock::now();
+    for (int i = 1; i <= 2; i++) {
+        auto inCore_raw = computeKCore_raw(
+            n,
+            encodeH ? G->degreeH : G->degreeV,
+            encodeH ? G->edgesH  : G->edgesV,
+            i
+        );
+        (void)inCore_raw;
+    }
+    auto t_kcore3 = chrono::high_resolution_clock::now();
+    cout << "K-core(raw) Time: "
+         << chrono::duration<double>(t_kcore3 - t_kcore2).count() << " s\n";
+
+    // -------------------------------------------------------------------------
+    // PageRank: compressed (decode-on-demand) and raw
+    //   pr_iters is provided by pagerank.h / build system; alpha = 0.85.
+    //   Pass edges[] as needed by your verification settings.
+    // -------------------------------------------------------------------------
+    runPageRankOnDemand_decodeRandom(
+        encodeH ? nh : nv,
+        encodeH ? G->degreeH : G->degreeV,
+        encodeH ? G->edgesH  : G->edgesV,    // pass nullptr if per-vertex verification is disabled
+        huffCount, bitCount,
+        hi, lo,
+        encodeH ? tV : tH, encodeH ? fbV : fbH,
+        20, 0.85,
+        blockHi, blockLo, BLOCK
+    );
+
+    runPageRankRaw(
+        encodeH ? nh : nv,
+        encodeH ? G->degreeH : G->degreeV,
+        encodeH ? G->edgesH  : G->edgesV,
+        20,
+        0.85
+    );
+
+    // -------------------------------------------------------------------------
+    // Full paged decode of the encoded side (optional verification if edges!=nullptr)
+    // -------------------------------------------------------------------------
+    using clock = std::chrono::high_resolution_clock;
+    auto t0 = clock::now();
+    auto nbrs = decodeSide(
+        encodeH ? nh : nv,
+        encodeH ? G->degreeH : G->degreeV,
+        encodeH ? G->edgesH  : G->edgesV,
+        huffCount, bitCount,
+        hi, lo,
+        encodeH ? tV : tH,
+        encodeH ? fbV : fbH,
+        blockHi, blockLo, BLOCK
+    );
+    (void)nbrs; // not used further in this driver
+    auto t1 = clock::now();
+    cout << "Decode Time: " << std::chrono::duration<double>(t1 - t0).count() << " s\n";
 
     // -------------------------------------------------------------------------
     // Cleanup
@@ -230,8 +238,11 @@ int main(int argc, char** argv) {
     freeTree(tV);
     freeTree(tH);
     delete[] bitCount;
+    delete[] huffCount;
     delete[] hi;
     delete[] lo;
+    delete[] blockHi;
+    delete[] blockLo;
     delete G;
 
     return 0;
