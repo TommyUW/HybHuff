@@ -16,4 +16,4 @@ make clean && make
 
 For example:
 
-./main 1.27 com-lj.all.cmty-hygra 
+./main 1.27 com-amazon-cmty-hygra 
