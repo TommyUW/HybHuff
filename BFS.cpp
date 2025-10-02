@@ -1,19 +1,10 @@
 // ==========================================================
-// File: BFS.cpp
-//
-// Description:
-// Implements breadth-first search (BFS) and connected components
-// traversal on bipartite hypergraphs represented using flat arrays
-// and adjacency lists. Designed to work with compressed hypergraph
-// representations.
-//
-// Algorithms:
-// - Connected Component Detection using alternating vertex ↔ hyperedge BFS
-// - Vertex-centric BFS from a fixed root
-// - All-pairs BFS from all vertices to estimate global reachability
-//
-// Author: Tianyu Zhao, University of Washington
-// Advisors: Prof. Dongfang Zhao, Dr. Luanzheng Guo, Dr. Nathan Tallent
+// File: BFS_block_memprofile.cpp (RSS-only profiling)
+// - Encoded BFS (block-indexed, on-demand decode) with OS-level
+//   Resident Set Size (RSS) measurements in BYTES.
+//   We report: peak block RSS Δ observed while loading a block.
+// - Raw BFS prints RSS at entry/exit and Δ.
+// - No allocator/capacity math; no external profilers.
 // ==========================================================
 
 #include "BFS.h"
@@ -21,174 +12,273 @@
 #include <queue>
 #include <chrono>
 #include <vector>
-#include <cassert>
+#include <climits>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <algorithm>
+#include <atomic>
+#include <unistd.h>       // sysconf
+#include <sys/resource.h>
+#include "decode.h"          // extract_block_slices(...), readBits(...)
+#include "huffman_tree.h"    // struct HuffmanNode { HuffmanNode *l,*r; int v; }
+#include "misc.h"
+#include <malloc.h>
 using namespace std;
 
-// ------------------------------------------------------------
-// Connected Component Detection (Bipartite BFS)
-//
-// Given the hypergraph in flattened CSR format (degree + edge list),
-// this function performs BFS alternately across vertices and
-// hyperedges. Each connected component is labeled with an ID.
-// This traversal is used to build component-aware offsets for BFS.
-// ------------------------------------------------------------
-void runConnectedComponents(Hypergraph* G, int nv, int nh,
-                            vector<vector<int>>& adj,
-                            vector<int>& offsetV,
-                            vector<int>& offsetH) {
-    auto t_cc0 = chrono::high_resolution_clock::now();
-
-    // Compute CSR-style offsets for vertex and hyperedge neighbors
-    offsetV.assign(nv + 1, 0);
-    for (int v = 0; v < nv; ++v)
-        offsetV[v + 1] = offsetV[v] + G->degreeV[v];
-    assert(offsetV[nv] == G->mv);
-
-    offsetH.assign(nh + 1, 0);
-    for (int e = 0; e < nh; ++e)
-        offsetH[e + 1] = offsetH[e] + G->degreeH[e];
-    assert(offsetH[nh] == G->mh);
-
-    // Initialize visitation and component ID markers
-    vector<char> visitedV(nv, 0), visitedE(nh, 0);
-    vector<int> compIDV(nv, -1), compIDE(nh, -1);
-    queue<pair<bool, int>> bfsQ;
-
-    int compLabel = 0;
-
-    // Start BFS from each unvisited vertex
-    for (int v0 = 0; v0 < nv; ++v0) {
-        if (visitedV[v0]) continue;
-
-        visitedV[v0] = 1;
-        compIDV[v0] = compLabel;
-        bfsQ.push({false, v0});  // (isHyperedge=false, vertexID)
-
-        // Perform bipartite BFS traversal (vertex ↔ hyperedge)
-        while (!bfsQ.empty()) {
-            auto [isHE, id] = bfsQ.front();
-            bfsQ.pop();
-
-            if (!isHE) {  // vertex → hyperedge neighbors
-                int base = offsetV[id];
-                for (int i = 0; i < G->degreeV[id]; ++i) {
-                    int e = G->edgesV[base + i];
-                    if (e < 0 || e >= nh || visitedE[e]) continue;
-                    visitedE[e] = 1;
-                    compIDE[e] = compLabel;
-                    bfsQ.push({true, e});
-                }
-            } else {  // hyperedge → vertex neighbors
-                int base = offsetH[id];
-                for (int i = 0; i < G->degreeH[id]; ++i) {
-                    int u = G->edgesH[base + i];
-                    if (u < 0 || u >= nv || visitedV[u]) continue;
-                    visitedV[u] = 1;
-                    compIDV[u] = compLabel;
-                    bfsQ.push({false, u});
-                }
-            }
+static inline size_t rss_bytes_strict() {
+#if defined(__linux__)
+    if (FILE* f = fopen("/proc/self/smaps_rollup", "r")) {
+        char key[64]; unsigned long kb;
+        while (fscanf(f, "%63s %lu", key, &kb) == 2) {
+            if (strcmp(key, "Rss:") == 0) { fclose(f); return (size_t)kb * 1024ull; }
         }
-
-        compLabel++;  // new component
+        fclose(f);
     }
-
-    auto t_cc1 = chrono::high_resolution_clock::now();
-    cout << "Connected Components time: "
-         << chrono::duration<double>(t_cc1 - t_cc0).count() << " s\n";
+    if (FILE* f = fopen("/proc/self/status", "r")) {
+        char key[64]; unsigned long kb;
+        while (fscanf(f, "%63s %lu", key, &kb) == 2) {
+            if (strncmp(key, "VmRSS:", 6) == 0) { fclose(f); return (size_t)kb * 1024ull; }
+        }
+        fclose(f);
+    }
+    if (FILE* f = fopen("/proc/self/statm", "r")) {
+        unsigned long pages=0, dummy=0;
+        if (fscanf(f, "%lu %lu", &dummy, &pages) == 2) {
+            fclose(f);
+            long ps = sysconf(_SC_PAGESIZE); if (ps <= 0) ps = 4096;
+            return (size_t)pages * (size_t)ps;
+        }
+        fclose(f);
+    }
+#endif
+    // portable fallback
+    rusage ru; getrusage(RUSAGE_SELF, &ru);
+#if defined(__APPLE__) && defined(__MACH__)
+    return (size_t)(ru.ru_maxrss / 1024) * 1024ull;
+#else
+    return (size_t)ru.ru_maxrss * 1024ull;
+#endif
 }
 
-// ------------------------------------------------------------
-// Single-source BFS from fixed vertex (e.g., vertex 5050)
-//
-// Traverses bipartite hypergraph starting from a vertex,
-// alternates vertex → hyperedge → vertex expansions.
-// Measures distance from the root to all reachable vertices.
-// ------------------------------------------------------------
-void runBFS(int nv, int nh, const int* degreeV, const int* edgesV,
-            const int* degreeH, const int* edgesH,
-            const int* offsetV, const int* offsetH) {
+// =============================================================
+// Single-source BFS (encoded graph, block-indexed, parallel),
+// with RSS-only accounting of block loads.
+// =============================================================
+void runBFSFromSingleSource(
+    int n, const int* deg, const int* edges,
+    const uint16_t* huffCount, const uint16_t* bitCount,
+    const uint8_t* hi, const uint8_t* lo,
+    HuffmanNode* treeOpp, int fallbackBitsOpp,
+    int src,
+    const uint64_t* blockHi, const uint64_t* blockLo, int BLOCK
+) {
+    using clock = std::chrono::high_resolution_clock;
+    auto t0 = clock::now();
 
-    auto t_bfs0 = chrono::high_resolution_clock::now();
-    vector<int> distB(nv, -1);
-    queue<int> qB;
-
-    int startV = 5050;  // source vertex
-    if (startV >= 0 && startV < nv) {
-        distB[startV] = 0;
-        qB.push(startV);
-
-        while (!qB.empty()) {
-            int v = qB.front(); qB.pop();
-            int d = distB[v];
-
-            // vertex → hyperedges
-            for (int i = 0; i < degreeV[v]; ++i) {
-                int e = edgesV[offsetV[v] + i];
-                if (e < 0 || e >= nh) continue;
-
-                // hyperedge → vertices
-                for (int j = 0; j < degreeH[e]; ++j) {
-                    int u = edgesH[offsetH[e] + j];
-                    if (u < 0 || u >= nv || distB[u] != -1) continue;
-                    distB[u] = d + 1;
-                    qB.push(u);
-                }
-            }
-        }
-
-        // Report stats
-        int reached = count_if(distB.begin(), distB.end(), [](int d) { return d != -1; });
-        cout << "\nBFS from vertex " << startV << " reached " << reached << " / " << nv << " vertices\n";
-
-        int toShow = min(nv, 10);
-        cout << "Distances (vertex → distance):\n";
-        for (int v = 0; v < toShow; ++v) {
-            cout << "  v=" << v << (distB[v] == -1 ? " unreachable\n"
-                                                   : (" → " + to_string(distB[v]) + "\n"));
-        }
+    if (n <= 0 || src < 0 || src >= n) { std::cout << "Single-source BFS: invalid n/src\n"; return; }
+    if (!deg || !huffCount || !bitCount || !hi || !lo || !treeOpp ||
+        !blockHi || !blockLo || BLOCK <= 0) {
+        std::cerr << "Single-source BFS: missing/invalid inputs\n";
+        return;
     }
 
-    auto t_bfs1 = chrono::high_resolution_clock::now();
-    cout << "BFS runtime: " << chrono::duration<double>(t_bfs1 - t_bfs0).count() << " s\n";
+    const int INF = INT_MAX/4;
+    std::vector<int> dist(n, INF);
+    dist[src] = 0;
+
+    // Level-synchronous frontier
+    std::vector<int> frontier, nextFrontier;
+    frontier.push_back(src);
+    int maxLevel = 0, reached = 1;
+
+    // RSS-based accounting for encoded BFS (OS-level resident bytes)
+    size_t peak_block_rss_bytes = 0; // max RSS delta seen on a single block load
+
+    while (!frontier.empty()) {
+        const int nextLevel = maxLevel + 1;
+        nextFrontier.clear();
+
+        // Parallel over the current frontier
+        #pragma omp parallel
+        {
+            // Thread-local block cache (avoid contention)
+            int t_curBlk = -1, t_blk_i0 = 0, t_blk_i1 = 0;
+            std::vector<int>       t_deg_blk;
+            std::vector<uint16_t>  t_bit_blk, t_huff_blk;
+            std::vector<uint8_t>   t_hiSlice, t_loSlice;
+            uint32_t               t_baseHiOffset = 0, t_baseLoOffset = 0;
+            std::vector<uint64_t>  t_offHiBits, t_offLoBits; // helper arrays (not measured specifically)
+
+            std::vector<int> t_localNext;  t_localNext.reserve(1024); // thread-local buffer
+
+            auto ensure_block_loaded = [&](int blk) {
+                if (blk == t_curBlk) return;
+                t_curBlk = blk;
+                t_blk_i0 = blk * BLOCK;
+                t_blk_i1 = std::min(n, t_blk_i0 + BLOCK);
+
+                // Release previous block buffers to reduce allocator noise
+                std::vector<uint8_t>().swap(t_hiSlice);
+                std::vector<uint8_t>().swap(t_loSlice);
+                std::vector<int>().swap(t_deg_blk);
+                std::vector<uint16_t>().swap(t_bit_blk);
+                std::vector<uint16_t>().swap(t_huff_blk);
+                malloc_trim(0);  // try to return free memory to OS
+                t_baseHiOffset = t_baseLoOffset = 0;
+
+                // Measure RSS delta around the block load.
+                size_t r0 = 0, r1 = 0;
+                #pragma omp critical(__bfs_block_rss)
+                {
+                    r0 = rss_bytes_strict();
+
+                    extract_block_slices(
+                        t_blk_i0, t_blk_i1,
+                        BLOCK,
+                        deg, bitCount, huffCount,
+                        hi, lo,
+                        blockHi, blockLo,
+                        fallbackBitsOpp,
+                        t_deg_blk, t_bit_blk, t_huff_blk,
+                        t_hiSlice, t_loSlice,
+                        t_baseHiOffset, t_baseLoOffset
+                    );
+
+                    r1 = rss_bytes_strict();
+                }
+                const size_t loaded_bytes = (t_hiSlice.size() + t_loSlice.size());
+                const size_t my_block_rss = (loaded_bytes == 0) ? 0 : (r1 > r0 ? (r1 - r0) : 0);
+                #pragma omp critical(__bfs_peak_block_rss)
+                peak_block_rss_bytes = std::max(peak_block_rss_bytes, my_block_rss);
+
+
+                // Precompute per-entry bit offsets
+                const int L = t_blk_i1 - t_blk_i0;
+                t_offHiBits.assign(L, 0);
+                t_offLoBits.assign(L, 0);
+                uint64_t accH = 0, accL = 0;
+                for (int k = 0; k < L; ++k) {
+                    t_offHiBits[k] = accH;
+                    t_offLoBits[k] = accL;
+                    accH += (uint64_t)t_bit_blk[k];
+                    accL += (uint64_t)(t_deg_blk[k] - t_huff_blk[k]) * (uint64_t)fallbackBitsOpp;
+                }
+            };
+
+            #pragma omp for schedule(dynamic, 1024)
+            for (int i = 0; i < (int)frontier.size(); ++i) {
+                int u = frontier[i];
+                if (deg[u] == 0) continue; // isolated
+
+                const int blk = u / BLOCK;
+                ensure_block_loaded(blk);
+
+                const int k = u - t_blk_i0;
+                const uint32_t hiOff = t_baseHiOffset + (uint32_t)t_offHiBits[k];
+                const uint32_t loOff = t_baseLoOffset + (uint32_t)t_offLoBits[k];
+
+                // Decode neighbors of u from the thread-local cached slices
+                std::vector<int> nbrs = decode_single_entry_from_slices(
+                    &t_deg_blk[k], &t_bit_blk[k], &t_huff_blk[k],
+                    t_hiSlice.data(), t_loSlice.data(),
+                    hiOff, loOff,
+                    treeOpp, fallbackBitsOpp
+                );
+
+                // Visit neighbors
+                for (int v : nbrs) {
+                    if ((unsigned)v >= (unsigned)n) continue;
+                    if (dist[v] != INF) continue;
+                    // mark visited once
+                    #pragma omp critical(__bfs_visit_dist)
+                    {
+                        if (dist[v] == INF) {
+                            dist[v] = nextLevel;
+                            t_localNext.push_back(v);
+                        }
+                    }
+                }
+            } // for frontier
+
+            // Merge thread-local next frontier
+            #pragma omp critical(__bfs_merge_next)
+            {
+                reached += (int)t_localNext.size();
+                nextFrontier.insert(nextFrontier.end(),
+                                    t_localNext.begin(), t_localNext.end());
+            }
+        } // parallel
+
+        // Deduplicate nextFrontier
+        std::sort(nextFrontier.begin(), nextFrontier.end());
+        nextFrontier.erase(std::unique(nextFrontier.begin(), nextFrontier.end()), nextFrontier.end());
+
+        frontier.swap(nextFrontier);
+        if (!frontier.empty()) maxLevel = nextLevel;
+    }
+
+    auto t1 = clock::now();
+
+    // Report RSS-based block memory usage (bytes)
+    std::cout << std::fixed;
+    std::cout << "BFS(Hybhuff): peak block RSS \xCE\x94 = " << peak_block_rss_bytes << " bytes"
+              << "Final RSS: " << rss_bytes()
+                << " | time = " << std::chrono::duration<double>(t1 - t0).count() << " s\n";
+    
 }
 
-// ------------------------------------------------------------
-// Full BFS from every vertex
-//
-// Runs BFS starting from each vertex in the decoded adjacency list.
-// Aggregates the total number of reachable vertices across runs.
-// Used to simulate dense traversal workloads for comparison.
-// ------------------------------------------------------------
-void runFullBFSAllVertices(const vector<vector<int>>& adj) {
-    auto t0 = chrono::high_resolution_clock::now();
-    size_t N = adj.size();
-    int totalReach = 0;
+// =============================================================
+// BFS without decoding: uses deg[] + edges[] directly.
+// Prints RSS at entry/exit and delta in BYTES.
+// =============================================================
+std::vector<int> bfs_single_source_raw(
+    int n,
+    const int* deg,
+    const int* edges,
+    int src
+) {
+    using clock = std::chrono::high_resolution_clock;
+    auto t0 = clock::now();
 
-    for (size_t src = 0; src < N; ++src) {
-        vector<char> vis(N, 0);
-        queue<int> q;
-        vis[src] = 1;
-        q.push(src);
-        int count = 1;
-
-        // Classic unweighted BFS from `src`
-        while (!q.empty()) {
-            int u = q.front(); q.pop();
-            for (int v : adj[u]) {
-                if ((unsigned)v < N && !vis[v]) {
-                    vis[v] = 1;
-                    q.push(v);
-                    ++count;
-                }
-            }
-        }
-
-        totalReach += count;
+    std::vector<int> dist(n, INT_MAX/4);
+    if (n <= 0 || src < 0 || src >= n) {
+        return dist;
     }
 
-    auto t1 = chrono::high_resolution_clock::now();
-    cout << "All-vertex BFS finished. Total reach count: " << totalReach
-         << " | Time: " << chrono::duration<double>(t1 - t0).count() << " s\n";
+    // Build CSR offsets once (prefix sum)
+    std::vector<long long> off(n + 1, 0);
+    for (int i = 0; i < n; ++i) off[i + 1] = off[i] + (long long)deg[i];
+
+    size_t r_before = rss_bytes();
+    std::queue<int> q;
+    dist[src] = 0;
+    q.push(src);
+
+    int reached = 1, maxLevel = 0;
+
+    while (!q.empty()) {
+        int u = q.front(); q.pop();
+        int nextLevel = dist[u] + 1;
+
+        const long long b = off[u], e = off[u + 1];
+        for (long long p = b; p < e; ++p) {
+            int v = edges[p];
+            if ((unsigned)v >= (unsigned)n) continue;
+            if (dist[v] != INT_MAX/4) continue;
+            dist[v] = nextLevel;
+            q.push(v);
+            ++reached;
+        }
+        if (e > b && nextLevel > maxLevel) maxLevel = nextLevel;
+    }
+
+    auto t1 = clock::now();
+    size_t r_after = rss_bytes();
+    
+    std::cout << "BFS(raw): reached=" << reached
+              << " | RSS \xCE\x94 = " << (r_after > r_before ? (r_after - r_before) : 0) << " bytes"
+              << " | time=" << std::chrono::duration<double>(t1 - t0).count() << " s\n";
+    return dist;
 }
