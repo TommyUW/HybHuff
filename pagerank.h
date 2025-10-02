@@ -2,7 +2,8 @@
 #define PAGERANK_H
 
 #include <vector>
-
+#include <cstdint>
+#include "huffman_tree.h"
 /**
  * @file pagerank.h
  * @brief Header file for hypergraph PageRank implementation.
@@ -18,15 +19,22 @@
  *
  */
 
-/**
- * @brief Run PageRank on a bipartite hypergraph.
- *
- * @param v2he  Adjacency list from vertices to hyperedges
- * @param he2v  Adjacency list from hyperedges to vertices
- * @param iters Number of PageRank iterations to perform
- */
-void runPageRank(const std::vector<std::vector<int>>& v2he,
-                 const std::vector<std::vector<int>>& he2v,
-                 int iters);
+void runPageRankRaw(
+    int n,                    // number of vertices
+    const int* deg,           // out-degree per vertex
+    const int* edges,         // flat adjacency list, length = sum(deg)
+    int iters,
+    double alpha /*=0.85*/
+);
+
+void runPageRankOnDemand_decodeRandom(
+    int n, const int* deg, const int* edges,
+    const uint16_t* huffCount, const uint16_t* bitCount,
+    const uint8_t* hi, const uint8_t* lo,
+    HuffmanNode* treeOpp, int fallbackBitsOpp,
+    int iters, double alpha,
+    // block index (precomputed in encode; no decoding)
+    const uint64_t* blockHi, const uint64_t* blockLo, int BLOCK
+);
 
 #endif // PAGERANK_H
