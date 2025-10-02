@@ -2,7 +2,9 @@
 #define CORE_DECOMPOSITION_H
 
 #include <vector>
-
+#include <cstdint>
+#include "huffman_tree.h"
+using namespace std;
 /**
  * @file core_decomposition.h
  * @brief Header file for k-core decomposition on bipartite hypergraphs.
@@ -28,8 +30,25 @@
  * @param k_thresh Minimum degree threshold (k).
  * @return         A binary vector (`char` type), where 1 means in-core and 0 means pruned.
  */
-std::vector<char> computeKCore(const std::vector<std::vector<int>>& v2he,
-                               const std::vector<std::vector<int>>& he2v,
-                               int k_thresh);
+vector<char> computeKCore_onDemand_decodeRandom(
+    int n,
+    const int* deg,
+    const uint16_t* huffCount,
+    const uint16_t* bitCount,
+    const uint8_t* neighHi,
+    const uint8_t* neighLo,
+    HuffmanNode* treeOpp,
+    int fallbackBitsOpp,
+    const uint64_t* blockHi,
+    const uint64_t* blockLo,
+    int BLOCK,
+    int k_thresh
+);
 
+vector<char> computeKCore_raw(
+    int n,
+    const int* deg,
+    const int* edges,
+    int k_thresh
+);
 #endif // CORE_DECOMPOSITION_H
