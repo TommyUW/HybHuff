@@ -9,6 +9,9 @@ Hypergraphs provide a natural representation for many-to-many relationships in d
 
 ## Quick Start
 make clean && make
-./main <percentage> Hypergraphs/<dataset>
+
+./main <percentage> Hypergraphs/dataset
+
 For example:
+
 ./main 1.27 Hypergraphs/com-lj.all.cmty-hygra 
