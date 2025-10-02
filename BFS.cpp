@@ -1,10 +1,12 @@
 // ==========================================================
-// File: BFS_block_memprofile.cpp (RSS-only profiling)
-// - Encoded BFS (block-indexed, on-demand decode) with OS-level
-//   Resident Set Size (RSS) measurements in BYTES.
-//   We report: peak block RSS Δ observed while loading a block.
-// - Raw BFS prints RSS at entry/exit and Δ.
-// - No allocator/capacity math; no external profilers.
+// File: BFS_block_memprofile.cpp
+// Purpose: Level-synchronous single-source BFS for two modes:
+//   (1) Encoded graph with block-indexed, on-demand decoding.
+//   (2) Raw CSR baseline (deg[] + edges[]).
+// Notes:
+//   • Encoded mode caches one block per thread and decodes a
+//     single vertex’s neighbors from local slices.
+//   • Raw mode builds CSR offsets and performs a standard BFS.
 // ==========================================================
 
 #include "BFS.h"
@@ -21,50 +23,31 @@
 #include <atomic>
 #include <unistd.h>       // sysconf
 #include <sys/resource.h>
-#include "decode.h"          // extract_block_slices(...), readBits(...)
+#include "decode.h"          // extract_block_slices(...), decode_single_entry_from_slices(...)
 #include "huffman_tree.h"    // struct HuffmanNode { HuffmanNode *l,*r; int v; }
 #include "misc.h"
 #include <malloc.h>
 using namespace std;
 
-static inline size_t rss_bytes_strict() {
-#if defined(__linux__)
-    if (FILE* f = fopen("/proc/self/smaps_rollup", "r")) {
-        char key[64]; unsigned long kb;
-        while (fscanf(f, "%63s %lu", key, &kb) == 2) {
-            if (strcmp(key, "Rss:") == 0) { fclose(f); return (size_t)kb * 1024ull; }
-        }
-        fclose(f);
-    }
-    if (FILE* f = fopen("/proc/self/status", "r")) {
-        char key[64]; unsigned long kb;
-        while (fscanf(f, "%63s %lu", key, &kb) == 2) {
-            if (strncmp(key, "VmRSS:", 6) == 0) { fclose(f); return (size_t)kb * 1024ull; }
-        }
-        fclose(f);
-    }
-    if (FILE* f = fopen("/proc/self/statm", "r")) {
-        unsigned long pages=0, dummy=0;
-        if (fscanf(f, "%lu %lu", &dummy, &pages) == 2) {
-            fclose(f);
-            long ps = sysconf(_SC_PAGESIZE); if (ps <= 0) ps = 4096;
-            return (size_t)pages * (size_t)ps;
-        }
-        fclose(f);
-    }
-#endif
-    // portable fallback
-    rusage ru; getrusage(RUSAGE_SELF, &ru);
-#if defined(__APPLE__) && defined(__MACH__)
-    return (size_t)(ru.ru_maxrss / 1024) * 1024ull;
-#else
-    return (size_t)ru.ru_maxrss * 1024ull;
-#endif
-}
-
 // =============================================================
-// Single-source BFS (encoded graph, block-indexed, parallel),
-// with RSS-only accounting of block loads.
+// Encoded BFS (block-indexed, on-demand decode; parallel-friendly).
+// Inputs:
+//   n                : #vertices
+//   deg              : per-vertex degree (encoded-side semantics)
+//   edges            : unused in encoded mode (kept for symmetry)
+//   huffCount        : #Huffman-coded items per vertex in block
+//   bitCount         : #bits contributed by Huffman-coded items
+//   hi, lo           : compressed bitstreams
+//   treeOpp          : Huffman tree (opposite side)
+//   fallbackBitsOpp  : fixed width for fallback-coded items
+//   src              : BFS source
+//   blockHi, blockLo : per-block base bit offsets
+//   BLOCK            : block size (vertex granularity)
+// Behavior:
+//   • Processes current frontier; per thread, lazily loads the
+//     block containing u and decodes neighbors of u only.
+//   • Thread-local vectors avoid cross-thread contention.
+//   • Next frontier is deduplicated before the next level.
 // =============================================================
 void runBFSFromSingleSource(
     int n, const int* deg, const int* edges,
@@ -77,6 +60,7 @@ void runBFSFromSingleSource(
     using clock = std::chrono::high_resolution_clock;
     auto t0 = clock::now();
 
+    // Basic input checks (fail fast).
     if (n <= 0 || src < 0 || src >= n) { std::cout << "Single-source BFS: invalid n/src\n"; return; }
     if (!deg || !huffCount || !bitCount || !hi || !lo || !treeOpp ||
         !blockHi || !blockLo || BLOCK <= 0) {
@@ -93,47 +77,41 @@ void runBFSFromSingleSource(
     frontier.push_back(src);
     int maxLevel = 0, reached = 1;
 
-    // RSS-based accounting for encoded BFS (OS-level resident bytes)
-    size_t peak_block_rss_bytes = 0; // max RSS delta seen on a single block load
+    // Peak block metric placeholder (intentionally unused here).
+    size_t peak_block_rss_bytes = 0;
 
     while (!frontier.empty()) {
         const int nextLevel = maxLevel + 1;
         nextFrontier.clear();
 
-        // Parallel over the current frontier
+        // Parallelize across current frontier.
         #pragma omp parallel
         {
-            // Thread-local block cache (avoid contention)
+            // -------- Thread-local block cache --------
+            // The following buffers/slices are re-populated when
+            // the thread switches to a different block.
             int t_curBlk = -1, t_blk_i0 = 0, t_blk_i1 = 0;
             std::vector<int>       t_deg_blk;
             std::vector<uint16_t>  t_bit_blk, t_huff_blk;
             std::vector<uint8_t>   t_hiSlice, t_loSlice;
             uint32_t               t_baseHiOffset = 0, t_baseLoOffset = 0;
-            std::vector<uint64_t>  t_offHiBits, t_offLoBits; // helper arrays (not measured specifically)
+            std::vector<uint64_t>  t_offHiBits, t_offLoBits;
 
-            std::vector<int> t_localNext;  t_localNext.reserve(1024); // thread-local buffer
+            // Accumulate thread-local discoveries and merge once.
+            std::vector<int> t_localNext;  t_localNext.reserve(1024);
 
+            // Load/calc slices for block 'blk' if not already active.
+            // Populates per-entry offset arrays used for decode.
             auto ensure_block_loaded = [&](int blk) {
                 if (blk == t_curBlk) return;
                 t_curBlk = blk;
                 t_blk_i0 = blk * BLOCK;
                 t_blk_i1 = std::min(n, t_blk_i0 + BLOCK);
-
-                // Release previous block buffers to reduce allocator noise
-                std::vector<uint8_t>().swap(t_hiSlice);
-                std::vector<uint8_t>().swap(t_loSlice);
-                std::vector<int>().swap(t_deg_blk);
-                std::vector<uint16_t>().swap(t_bit_blk);
-                std::vector<uint16_t>().swap(t_huff_blk);
-                malloc_trim(0);  // try to return free memory to OS
                 t_baseHiOffset = t_baseLoOffset = 0;
 
-                // Measure RSS delta around the block load.
-                size_t r0 = 0, r1 = 0;
+                // Extract contiguous slices for [t_blk_i0, t_blk_i1).
                 #pragma omp critical(__bfs_block_rss)
                 {
-                    r0 = rss_bytes_strict();
-
                     extract_block_slices(
                         t_blk_i0, t_blk_i1,
                         BLOCK,
@@ -145,16 +123,9 @@ void runBFSFromSingleSource(
                         t_hiSlice, t_loSlice,
                         t_baseHiOffset, t_baseLoOffset
                     );
-
-                    r1 = rss_bytes_strict();
                 }
-                const size_t loaded_bytes = (t_hiSlice.size() + t_loSlice.size());
-                const size_t my_block_rss = (loaded_bytes == 0) ? 0 : (r1 > r0 ? (r1 - r0) : 0);
-                #pragma omp critical(__bfs_peak_block_rss)
-                peak_block_rss_bytes = std::max(peak_block_rss_bytes, my_block_rss);
 
-
-                // Precompute per-entry bit offsets
+                // Precompute per-entry bit offsets within the slices.
                 const int L = t_blk_i1 - t_blk_i0;
                 t_offHiBits.assign(L, 0);
                 t_offLoBits.assign(L, 0);
@@ -167,19 +138,21 @@ void runBFSFromSingleSource(
                 }
             };
 
+            // Work over the current frontier; each u may trigger a block load.
             #pragma omp for schedule(dynamic, 1024)
             for (int i = 0; i < (int)frontier.size(); ++i) {
                 int u = frontier[i];
-                if (deg[u] == 0) continue; // isolated
+                if (deg[u] == 0) continue; // isolated vertex
 
                 const int blk = u / BLOCK;
                 ensure_block_loaded(blk);
 
+                // Local index inside the active block.
                 const int k = u - t_blk_i0;
                 const uint32_t hiOff = t_baseHiOffset + (uint32_t)t_offHiBits[k];
                 const uint32_t loOff = t_baseLoOffset + (uint32_t)t_offLoBits[k];
 
-                // Decode neighbors of u from the thread-local cached slices
+                // Decode neighbors of u from thread-local slices only.
                 std::vector<int> nbrs = decode_single_entry_from_slices(
                     &t_deg_blk[k], &t_bit_blk[k], &t_huff_blk[k],
                     t_hiSlice.data(), t_loSlice.data(),
@@ -187,11 +160,10 @@ void runBFSFromSingleSource(
                     treeOpp, fallbackBitsOpp
                 );
 
-                // Visit neighbors
+                // Standard BFS relax.
                 for (int v : nbrs) {
                     if ((unsigned)v >= (unsigned)n) continue;
                     if (dist[v] != INF) continue;
-                    // mark visited once
                     #pragma omp critical(__bfs_visit_dist)
                     {
                         if (dist[v] == INF) {
@@ -200,18 +172,18 @@ void runBFSFromSingleSource(
                         }
                     }
                 }
-            } // for frontier
+            } // frontier loop
 
-            // Merge thread-local next frontier
+            // Merge thread-local next frontier.
             #pragma omp critical(__bfs_merge_next)
             {
                 reached += (int)t_localNext.size();
                 nextFrontier.insert(nextFrontier.end(),
                                     t_localNext.begin(), t_localNext.end());
             }
-        } // parallel
+        } // parallel region
 
-        // Deduplicate nextFrontier
+        // Remove duplicates before proceeding to the next level.
         std::sort(nextFrontier.begin(), nextFrontier.end());
         nextFrontier.erase(std::unique(nextFrontier.begin(), nextFrontier.end()), nextFrontier.end());
 
@@ -220,18 +192,18 @@ void runBFSFromSingleSource(
     }
 
     auto t1 = clock::now();
-
-    // Report RSS-based block memory usage (bytes)
-    std::cout << std::fixed;
-    std::cout << "BFS(Hybhuff): peak block RSS \xCE\x94 = " << peak_block_rss_bytes << " bytes"
-              << "Final RSS: " << rss_bytes()
-                << " | time = " << std::chrono::duration<double>(t1 - t0).count() << " s\n";
-    
+    std::cout << "BFS(Hybhuff) time: "
+              << std::chrono::duration<double>(t1 - t0).count() << " s\n";
 }
 
 // =============================================================
-// BFS without decoding: uses deg[] + edges[] directly.
-// Prints RSS at entry/exit and delta in BYTES.
+// Raw CSR BFS (no decoding).
+// Inputs:
+//   n, deg[], edges[], src
+// Behavior:
+//   • Builds CSR offsets from deg[].
+//   • Standard queue-based BFS over edges[].
+//   • Returns distance array (INF for unreachable).
 // =============================================================
 std::vector<int> bfs_single_source_raw(
     int n,
@@ -247,11 +219,10 @@ std::vector<int> bfs_single_source_raw(
         return dist;
     }
 
-    // Build CSR offsets once (prefix sum)
+    // CSR offsets from degrees.
     std::vector<long long> off(n + 1, 0);
     for (int i = 0; i < n; ++i) off[i + 1] = off[i] + (long long)deg[i];
 
-    size_t r_before = rss_bytes();
     std::queue<int> q;
     dist[src] = 0;
     q.push(src);
@@ -275,10 +246,7 @@ std::vector<int> bfs_single_source_raw(
     }
 
     auto t1 = clock::now();
-    size_t r_after = rss_bytes();
-    
-    std::cout << "BFS(raw): reached=" << reached
-              << " | RSS \xCE\x94 = " << (r_after > r_before ? (r_after - r_before) : 0) << " bytes"
-              << " | time=" << std::chrono::duration<double>(t1 - t0).count() << " s\n";
+    std::cout << "BFS(raw) time: "
+              << std::chrono::duration<double>(t1 - t0).count() << " s\n";
     return dist;
 }
